@@ -66,12 +66,7 @@ module pcileech_bar_impl_mz0380_cfg (
     // everything else.
     // ------------------------------------------------------------------
     wire [9:0]  wr_word      = wr_addr[11:2];       // 0..1023 (full 4 KiB)
-    wire        wr_known     = (wr_word == W_INT_FLAG) ||
-                               (wr_word == W_NOTIFY0)  || (wr_word == W_NOTIFY1) ||
-                               (wr_word == W_INPUT)     || (wr_word == W_RECORD) ||
-                               (wr_word == W_BITRATE)   || (wr_word == W_QUALITY) ||
-                               (wr_word == W_GOP)       || (wr_word == W_QP_STEP) ||
-                               (wr_word == W_B_FRAMES);
+    wire        wr_known     = wr_known_word(wr_word);   // single known-word list
 
     always @ ( posedge clk ) begin
         if ( rst ) begin
