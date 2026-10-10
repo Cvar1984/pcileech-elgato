@@ -53,9 +53,12 @@ module pcileech_bar_impl_mz0380_mb (
     // block: reads of regs[] below use their old values by NBA semantics).
     bit [7:0]   cmd_opcode;
 
-    // periph handoff (one fire = one op; p_rd/p_wr are 1-cycle pulses)
+    // periph handoff (one fire = one op; p_rd/p_wr are 1-cycle pulses).
+    // The periph registers its result, so rdata/nak are valid the cycle
+    // after p_rd: p_rd_d delays the read pulse to align the result capture.
     bit         p_rd;
     bit         p_wr;
+    bit         p_rd_d;
     bit [7:0]   p_rdata;
     bit         p_nak;
 
@@ -72,6 +75,28 @@ module pcileech_bar_impl_mz0380_mb (
             default:                              return 1'b0;
         endcase
     endfunction
+
+    function automatic bit periph_is_rd( input bit [7:0] op );
+        case ( op )
+            MZ_CMD_GPIO_READ, MZ_CMD_REG_READ, MZ_CMD_I2C_READ_S: return 1'b1;
+            default:                                              return 1'b0;
+        endcase
+    endfunction
+
+    // GPIO ops (0x14/0x15/0x17) carry {mask=PARAM1, data=PARAM2}; the I2C /
+    // bridge ops carry {chip=PARAM1, reg=PARAM2, value=PARAM3}. PARAM(i) lives
+    // in regs[1+i] (PARAM0 = regs[1] = opcode), so the periph's reg/wdata
+    // inputs shift by one word between the two command shapes.
+    wire        is_gpio_op  = (cmd_opcode == MZ_CMD_GPIO_READ) ||
+                              (cmd_opcode == MZ_CMD_GPIO_SET)  ||
+                              (cmd_opcode == MZ_CMD_GPIO_DIR);
+    wire [7:0]  periph_chip  = regs[2][7:0];                        // PARAM1
+    wire [7:0]  periph_reg   = is_gpio_op ? regs[2][7:0]            // PARAM1 (mask)
+                                          : regs[3][7:0];           // PARAM2 (reg)
+    wire [7:0]  periph_wdata = is_gpio_op ? regs[3][7:0]            // PARAM2 (data)
+                                          : regs[4][7:0];           // PARAM3 (value)
+    // EDID bulk payload = PARAM4..PARAM7 = regs[5..8], 16 bytes LSB-first.
+    wire [127:0] periph_bulk = { regs[8], regs[7], regs[6], regs[5] };
 
     function automatic bit [127:0] lf_read16( input bit [15:0] off );
         bit [127:0] d;
@@ -113,12 +138,14 @@ module pcileech_bar_impl_mz0380_mb (
             token_lo    <= 1'b0;
             p_rd        <= 1'b0;
             p_wr        <= 1'b0;
+            p_rd_d      <= 1'b0;
             lf_wr_fire  <= 1'b0;
         end
         else begin
             mz_int_ack  <= 1'b0;                                // default: pulse low
             p_rd        <= 1'b0;                                // default: 1-cycle pulse
             p_wr        <= 1'b0;                                // default: 1-cycle pulse
+            p_rd_d      <= p_rd;                                // delayed read pulse
             lf_wr_fire  <= 1'b0;                                // default: 1-cycle pulse
 
             // generic host writes to STATUS/EVENT/payload words (incl. the
@@ -199,7 +226,7 @@ module pcileech_bar_impl_mz0380_mb (
                         MZ_CMD_I2C_READ_S,
                         MZ_CMD_I2C_WRITE_S,
                         MZ_CMD_I2C_COMBO: begin
-                            p_rd <= 1'b1;
+                            p_rd <= periph_is_rd(regs[1][7:0]);
                             p_wr <= periph_is_wr(regs[1][7:0]);
                         end
                         MZ_CMD_LOAD_FILES: begin
@@ -242,12 +269,12 @@ module pcileech_bar_impl_mz0380_mb (
                 token_lo <= ~token_lo;
             end
 
-            // periph read result -> PARAM3 (reg.h: "read result lands in
-            // PARAM3"); NAK forces result 0 (M13). p_rd is the 1-cycle pulse
-            // set by the doorbell dispatch above and defaulted low this cycle,
-            // so this fires exactly on the cycle after a periph op fired.
-            if ( p_rd )
-                regs[3][7:0] <= p_nak ? 8'h0 : p_rdata;
+            // periph read result -> PARAM3 = regs[4] (reg.h: "read result
+            // lands in PARAM3"); NAK forces result 0 (M13). The periph
+            // registers rdata/nak, so they are valid one cycle after p_rd;
+            // p_rd_d fires the capture on that cycle.
+            if ( p_rd_d )
+                regs[4][7:0] <= p_nak ? 8'h0 : p_rdata;
 
             // LOAD_FILES write fire: 16 bytes from the PARAM payload into
             // scratch. lf_wr_fire is the 1-cycle pulse set by the doorbell
@@ -272,22 +299,20 @@ module pcileech_bar_impl_mz0380_mb (
     end
 
     // ------------------------------------------------------------------
-    // periph instance: bridge regs / GPIO / MST3367 / EDID
-    // p_chip = PARAM1, p_reg = PARAM2[7:0], p_wdata = PARAM3[7:0];
-    // bulk EDID payload = PARAM4..PARAM9 (16 bytes, LSB-first).
+    // periph instance: bridge regs / GPIO / MST3367 / EDID. The PARAM words
+    // feeding chip/reg/wdata are selected per command shape (see the
+    // periph_* wires above); EDID bulk payload = PARAM4..PARAM7.
     // ------------------------------------------------------------------
     pcileech_mz0380_periph i_periph (
         .rst            ( rst           ),
         .clk            ( clk           ),
         .p_op           ( cmd_opcode    ),
-        .p_chip         ( regs[1][7:0]  ),
-        .p_reg          ( regs[2][7:0]  ),
-        .p_wdata        ( regs[3][7:0]  ),
+        .p_chip         ( periph_chip   ),
+        .p_reg          ( periph_reg    ),
+        .p_wdata        ( periph_wdata  ),
         .p_rd_en        ( p_rd          ),
         .p_wr_en        ( p_wr          ),
-        .p_bulk_data    ( { regs[9], regs[8], regs[7], regs[6],
-                            regs[5], regs[4], regs[3], regs[2],
-                            regs[1], regs[0], 128'h0 }[127:0] ),
+        .p_bulk_data    ( periph_bulk   ),
         .p_bulk_len     ( 8'd16         ),
         .rdata          ( p_rdata       ),
         .nak            ( p_nak         )
