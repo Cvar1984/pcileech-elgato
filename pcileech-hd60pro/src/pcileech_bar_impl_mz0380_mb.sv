@@ -111,9 +111,15 @@ module pcileech_bar_impl_mz0380_mb (
             cmd_opcode  <= 8'h0;
             frame_cnt   <= 4'd0;
             token_lo    <= 1'b0;
+            p_rd        <= 1'b0;
+            p_wr        <= 1'b0;
+            lf_wr_fire  <= 1'b0;
         end
         else begin
             mz_int_ack  <= 1'b0;                                // default: pulse low
+            p_rd        <= 1'b0;                                // default: 1-cycle pulse
+            p_wr        <= 1'b0;                                // default: 1-cycle pulse
+            lf_wr_fire  <= 1'b0;                                // default: 1-cycle pulse
 
             // generic host writes to STATUS/EVENT/payload words (incl. the
             // ENC_STATUS clear handshake, M40)
@@ -235,6 +241,23 @@ module pcileech_bar_impl_mz0380_mb (
                                                                 // host must write 0 to ack
                 token_lo <= ~token_lo;
             end
+
+            // periph read result -> PARAM3 (reg.h: "read result lands in
+            // PARAM3"); NAK forces result 0 (M13). p_rd is the 1-cycle pulse
+            // set by the doorbell dispatch above and defaulted low this cycle,
+            // so this fires exactly on the cycle after a periph op fired.
+            if ( p_rd )
+                regs[3][7:0] <= p_nak ? 8'h0 : p_rdata;
+
+            // LOAD_FILES write fire: 16 bytes from the PARAM payload into
+            // scratch. lf_wr_fire is the 1-cycle pulse set by the doorbell
+            // dispatch; the PARAM/offset values it reads were latched then.
+            if ( lf_wr_fire ) begin
+                for ( int k = 0; k < 16; k++ ) begin
+                    lf_mem[(lf_offset + 16'(k)) & 12'hfff] <=
+                        regs[1 + k[3:2]][8*(k % 4) +: 8];
+                end
+            end
         end
     end
 
@@ -269,42 +292,6 @@ module pcileech_bar_impl_mz0380_mb (
         .rdata          ( p_rdata       ),
         .nak            ( p_nak         )
     );
-
-    // periph read result -> PARAM3 (reg.h: "read result lands in PARAM3");
-    // NAK forces result 0 (M13).
-    always @ ( posedge clk ) begin
-        if ( rst ) begin
-            p_rd <= 1'b0;
-            p_wr <= 1'b0;
-        end
-        else begin
-            p_rd <= 1'b0;                       // 1-cycle pulses
-            p_wr <= 1'b0;
-            if ( p_rd )
-                regs[3][7:0] <= p_nak ? 8'h0 : p_rdata;
-        end
-    end
-
-    // LOAD_FILES write fire: 16 bytes from PARAM1..PARAM4 into scratch.
-    // (lf_wr_fire is set by the doorbell case above, same cycle semantics
-    // as the PARAM values it needs.)
-    always @ ( posedge clk ) begin
-        if ( rst ) begin
-            lf_wr_fire <= 1'b0;
-        end
-        else begin
-            lf_wr_fire <= 1'b0;
-            if ( lf_wr_fire ) begin
-                for ( int k = 0; k < 16; k++ ) begin
-                    // PARAM(i) occupies cmd[4+4i .. 4+4i+3] LE; data bytes
-                    // cmd[8..23] = PARAM1..PARAM4, byte j of word i:
-                    // regs[1+k/4] byte (k%4).
-                    lf_mem[(lf_offset + 16'(k)) & 12'hfff] <=
-                        regs[1 + k[3:2]][8*(k % 4) +: 8];
-                end
-            end
-        end
-    end
 
     // ------------------------------------------------------------------
     // read path: 2-cycle pipeline (shape of pcileech_bar_impl_zerowrite4k)

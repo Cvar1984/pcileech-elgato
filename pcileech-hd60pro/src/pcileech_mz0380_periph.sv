@@ -173,18 +173,21 @@ module pcileech_mz0380_periph (
                             edid[p_reg] <= p_wdata;
                         end
                         else begin
-                            // MST3367: reg 0x00 = bank select (echoed), else RW
+                            // MST3367: reg 0x00 = bank select (echoed), else RW.
+                            // Index with the full 8-bit register offset: banks
+                            // are 256 bytes and the live constants sit above
+                            // 0x3f (0x55, 0x57.., 0x6a.., 0xe2).
                             if ( p_reg == 8'h00 )
                                 mst_bank <= p_wdata[1:0];
                             else
-                                mst[p_wdata[1:0] === 'x ? mst_bank : mst_bank][p_reg[5:0]] <= p_wdata;
+                                mst[mst_bank][p_reg] <= p_wdata;
                         end
                     end
                     else begin // I2C read
                         if ( is_edid )
                             rdata <= edid[p_reg];
                         else
-                            rdata <= mst[mst_bank][p_reg[5:0]];
+                            rdata <= mst[mst_bank][p_reg];
                     end
                 end
             end

@@ -16,18 +16,18 @@
 //     (4DW header: DW3 = address hi). Data dwords follow from beat 1.
 //     The rdengine packs pcie_id as {pcie_id[7:0], pcie_id[15:8]} - the
 //     16-bit ID occupies [15:0] of the dword in natural bit order.
-//   - has_data: registered packet count, the pkt_count pattern of
-//     pcileech_tlps128_src_fifo (1-cycle source latency assumed by
-//     pcileech_tlps128_sink_mux1).
+//   - has_data is held high for the whole active burst so the sink mux
+//     grants tready; a single beat is outstanding at a time (tvalid =
+//     beat_presented), retired the clk it is accepted (beat_accept).
 //
 // Beat layout per MemWr TLP (Max_Payload_Size = 512B, 16B per 128b beat):
 //   beat 0            : DW0, DW1, DW2, DW3                (tkeepdw 1111)
-//   beats 1..N-2      : 16 data bytes each                (tkeepdw 1111)
-//   beat N-1 (partial): last 12 data bytes                (tkeepdw 0111)
-//   full TLP: N=33 beats, 32*16 - 4 + ... = 512 data bytes exactly
-//             (31 full data beats + one 12-byte tail), Length=128 dwords
-//   tail TLP: N=29 beats, 27 full data beats + 12-byte tail = 448 bytes,
-//             Length=112 dwords
+//   beats 1..N-1      : 16 data bytes each                (tkeepdw 1111)
+//                       the last data beat asserts tlast
+//   Both payload sizes are exact multiples of 16B, so there is no partial
+//   tail beat:
+//   full TLP: N=33 beats (1 hdr + 32 data), 32*16 = 512 bytes, Length=128 dw
+//   tail TLP: N=29 beats (1 hdr + 28 data), 28*16 = 448 bytes, Length=112 dw
 //   6226 full + 1 tail = 6227 TLPs = 0x30a5c0 bytes exactly.
 //
 // One frame per START; STOP mid-send aborts at the next TLP boundary.
@@ -115,7 +115,6 @@ module pcileech_dma_engine (
     bit [3:0]   tkeepdw_q;
     bit [127:0] tdata_q;
     bit         beat_presented;                              // a beat sits in the regs
-    bit         beat_consumed;                               // mux took it this clk
 
     wire        arm_rise  = (state == S_IDLE) && mz_arm && (mz_vid_slots != 3'd0);
     wire        abort     = (state == S_SEND) && !mz_arm;    // STOP mid-send
@@ -140,12 +139,12 @@ module pcileech_dma_engine (
     assign tlps_out.tuser[0]   = first_q;
     assign tlps_out.tuser[8:1] = 8'h0;
 
-    bit [10:0]  pkt_count      = 0;
     wire        beat_ready     = tlps_out.tready;
-    wire        pkt_count_dec  = tlps_out.tvalid && tlps_out.tlast;
-    wire        pkt_count_inc  = beat_consumed && tlast_q;
-    wire [10:0] pkt_count_next = pkt_count + {10'b0, pkt_count_inc} - {10'b0, pkt_count_dec};
-    assign tlps_out.has_data   = (pkt_count_next > 0);
+    wire        beat_accept    = beat_presented && beat_ready;  // mux takes the beat this clk
+    // has_data must be high before the first beat is presented, otherwise the
+    // mux never grants tready and the source deadlocks: assert it for the whole
+    // active burst. One beat is outstanding at a time (tvalid = beat_presented).
+    assign tlps_out.has_data   = (state == S_SEND) && !abort;
     assign tlps_out.tvalid     = beat_presented;
 
     // ------------------------------------------------------------------
@@ -164,7 +163,6 @@ module pcileech_dma_engine (
             tkeepdw_q      <= 4'b0000;
             tdata_q        <= 128'h0;
             beat_presented <= 1'b0;
-            beat_consumed  <= 1'b0;
             mz_frame_done  <= 1'b0;
             mz_frame_token <= 32'h0;
             mz_int_req     <= 1'b0;
@@ -175,9 +173,6 @@ module pcileech_dma_engine (
             // interrupt handshake: level until host acks via 0x400 doorbell
             if ( mz_int_ack )
                 mz_int_req <= 1'b0;
-
-            // ---- beat consume: mux took the presented beat this clk ----
-            beat_consumed <= beat_presented && beat_ready;
 
             // ---- FSM ----
             case ( state )
@@ -194,7 +189,7 @@ module pcileech_dma_engine (
                     if ( abort ) begin
                         state <= S_IDLE;                         // no completion pulse
                     end
-                    else if ( beat_consumed && tlast_q ) begin
+                    else if ( beat_accept && tlast_q ) begin
                         if ( last_tlp ) begin
                             state          <= S_DONE;
                             mz_frame_done  <= 1'b1;
@@ -220,13 +215,15 @@ module pcileech_dma_engine (
                 end
             endcase
 
-            // ---- beat present ----
-            // One beat outstanding at a time: when the slot is free and the
-            // mux can take the next beat immediately, load it.
-            //   beat 0          : header (DW0..DW3), tkeepdw 1111
-            //   beats 1..N-2    : 16 data bytes,         tkeepdw 1111
-            //   beat N-1        : 12 data bytes,         tkeepdw 0111
-            if ( (state == S_SEND) && !abort && !beat_presented && beat_ready ) begin
+            // ---- beat present / retire ----
+            // One beat outstanding at a time. Load the next beat when the slot
+            // is free or is being accepted this clk (back-to-back). Both TLP
+            // payload sizes (512B full, 448B tail) are 16B-aligned, so every
+            // data beat is a full 16-byte beat (tkeepdw 1111); only the last
+            // data beat of the TLP asserts tlast.
+            //   beat 0                : header (DW0..DW3)
+            //   beats 1..cur_beats-1  : 16 data bytes, last one sets tlast
+            if ( (state == S_SEND) && !abort && (!beat_presented || beat_accept) ) begin
                 if ( beat_cnt == 6'd0 ) begin
                     // header beat
                     tdata_q        <= { dw3, dw2, dw1, dw0 };
@@ -236,8 +233,8 @@ module pcileech_dma_engine (
                     beat_presented <= 1'b1;
                     beat_cnt       <= 6'd1;
                 end
-                else if ( beat_cnt < (cur_beats - 6'd1) ) begin
-                    // full data beat: 16 splash bytes
+                else if ( beat_cnt < cur_beats ) begin
+                    // full data beat: 16 splash bytes; final data beat ends TLP
                     tdata_q        <= { splash_byte(byte_idx + 22'd15),
                                         splash_byte(byte_idx + 22'd14),
                                         splash_byte(byte_idx + 22'd13),
@@ -256,37 +253,20 @@ module pcileech_dma_engine (
                                         splash_byte(byte_idx + 22'd0) };
                     tkeepdw_q      <= 4'b1111;
                     first_q        <= 1'b0;
-                    tlast_q        <= 1'b0;
+                    tlast_q        <= ( beat_cnt == (cur_beats - 6'd1) );
                     beat_presented <= 1'b1;
                     beat_cnt       <= beat_cnt + 6'd1;
                     byte_idx       <= byte_idx + 22'd16;
                 end
-                else begin
-                    // partial data beat: last 12 bytes (tkeepdw 0111)
-                    tdata_q        <= { 32'h0,
-                                        splash_byte(byte_idx + 22'd11),
-                                        splash_byte(byte_idx + 22'd10),
-                                        splash_byte(byte_idx + 22'd9),
-                                        splash_byte(byte_idx + 22'd8),
-                                        splash_byte(byte_idx + 22'd7),
-                                        splash_byte(byte_idx + 22'd6),
-                                        splash_byte(byte_idx + 22'd5),
-                                        splash_byte(byte_idx + 22'd4),
-                                        splash_byte(byte_idx + 22'd3),
-                                        splash_byte(byte_idx + 22'd2),
-                                        splash_byte(byte_idx + 22'd1),
-                                        splash_byte(byte_idx + 22'd0) };
-                    tkeepdw_q      <= 4'b0111;
-                    first_q        <= 1'b0;
-                    tlast_q        <= 1'b1;
-                    beat_presented <= 1'b1;
-                    byte_idx       <= byte_idx + 22'd12;
+                else if ( beat_accept ) begin
+                    // all beats presented and the last was taken: free the slot
+                    // (the FSM above advances tlp_cnt / finishes this clk).
+                    beat_presented <= 1'b0;
                 end
             end
-
-            // free the slot the cycle after the mux consumed the beat
-            if ( beat_consumed )
+            else if ( beat_accept ) begin
                 beat_presented <= 1'b0;
+            end
         end
     end
 

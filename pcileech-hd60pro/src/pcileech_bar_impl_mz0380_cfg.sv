@@ -36,9 +36,9 @@ module pcileech_bar_impl_mz0380_cfg (
 
     // ------------------------------------------------------------------
     // word registers (byte addr / 4)
-    //   0x0c word 3   : INT_FLAG (0xdc)
-    //   0x0c word 12  : NOTIFY_PTR0 (0x30)
-    //   0x0e word 14  : NOTIFY_PTR1 (0x38)
+    //   0xdc word 55  : INT_FLAG (0xdc)
+    //   0x30 word 12  : NOTIFY_PTR0 (0x30)
+    //   0x38 word 14  : NOTIFY_PTR1 (0x38)
     //   0x10 word 16  : PROP_INPUT (0x40)  - reset 2 = HDMI
     //   0x16 word 22  : PROP_RECORD_MODE (0x58)
     //   0x17 word 23  : PROP_BITRATE (0x5c)
@@ -47,7 +47,7 @@ module pcileech_bar_impl_mz0380_cfg (
     //   0x21 word 33  : PROP_QP_STEP (0x84)
     //   0x22 word 34  : PROP_B_FRAMES (0x88)
     // ------------------------------------------------------------------
-    localparam int unsigned W_INT_FLAG   = 32'hdc >> 2;   // 3
+    localparam int unsigned W_INT_FLAG   = 32'hdc >> 2;   // 55
     localparam int unsigned W_NOTIFY0    = 32'h30 >> 2;   // 12
     localparam int unsigned W_NOTIFY1    = 32'h38 >> 2;   // 14
     localparam int unsigned W_INPUT      = 32'h40 >> 2;   // 16
@@ -65,7 +65,7 @@ module pcileech_bar_impl_mz0380_cfg (
     // flag word accepts "write 2 = clear" (M17 ack sequence) and ignores
     // everything else.
     // ------------------------------------------------------------------
-    wire [7:0]  wr_word      = wr_addr[9:2];        // 0..255 (4 KiB)
+    wire [9:0]  wr_word      = wr_addr[11:2];       // 0..1023 (full 4 KiB)
     wire        wr_known     = (wr_word == W_INT_FLAG) ||
                                (wr_word == W_NOTIFY0)  || (wr_word == W_NOTIFY1) ||
                                (wr_word == W_INPUT)     || (wr_word == W_RECORD) ||
@@ -99,8 +99,10 @@ module pcileech_bar_impl_mz0380_cfg (
                 prop[W_INT_FLAG] <= 32'h0;
             end
 
+            // all known words are < 64, so the low 6 bits index prop[] without
+            // loss; the full-width wr_known guard above rejects 4 KiB aliases.
             if ( wr_valid && wr_known && (wr_word != W_INT_FLAG) ) begin
-                prop[wr_word] <= wr_data;
+                prop[wr_word[5:0]] <= wr_data;
             end
         end
     end
@@ -123,8 +125,8 @@ module pcileech_bar_impl_mz0380_cfg (
             rd_req_ctx_1    <= rd_req_ctx;
             rd_req_addr_1   <= rd_req_addr;
             rd_req_valid_1  <= rd_req_valid;
-            rd_word         <= (wr_known_word(rd_req_addr_1[9:2])) ?
-                                prop[rd_req_addr_1[9:2]] : 32'h0;
+            rd_word         <= (wr_known_word(rd_req_addr_1[11:2])) ?
+                                prop[rd_req_addr_1[7:2]] : 32'h0;
         end
     end
 
@@ -134,7 +136,7 @@ module pcileech_bar_impl_mz0380_cfg (
         rd_rsp_valid    <= rd_req_valid_1;
     end
 
-    function automatic bit wr_known_word( input bit [7:0] w );
+    function automatic bit wr_known_word( input bit [9:0] w );
         case ( w )
             W_INT_FLAG, W_NOTIFY0, W_NOTIFY1, W_INPUT, W_RECORD,
             W_BITRATE, W_QUALITY, W_GOP, W_QP_STEP, W_B_FRAMES:
