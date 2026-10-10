@@ -112,8 +112,10 @@ module pcileech_mz0380_periph (
     // REG ops (bridge)
     wire is_reg_rd     = (p_op == 8'h1a) && p_rd_en && is_bridge;
     wire is_reg_wr     = (p_op == 8'h1b) && p_wr_en && is_bridge;
-    // generic I2C ops (MST3367 or EDID byte access)
-    wire is_i2c_rd     = (p_op == 8'h1a) && p_rd_en && (is_mst || is_edid);
+    // generic I2C ops (MST3367 or EDID byte access). The stack reaches the
+    // receiver through either the generic REG read (0x1a) or the dedicated
+    // I2C single read (0x1e); accept both (reg.h / DESIGN.md disagree on which).
+    wire is_i2c_rd     = ((p_op == 8'h1a) || (p_op == 8'h1e)) && p_rd_en && (is_mst || is_edid);
     wire is_i2c_wr     = (p_op == 8'h1b) && p_wr_en && (is_mst || is_edid);
 
     always @ ( posedge clk ) begin
@@ -122,6 +124,7 @@ module pcileech_mz0380_periph (
             nak          <= 1'b0;
             gpio_shadow  <= 16'h0000;
             edid_wr_ptr  <= 9'h0;
+            mst_bank     <= 2'd0;              // default bank 0 until host selects
         end
         else begin
             rdata <= 8'h00;

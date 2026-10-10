@@ -64,7 +64,6 @@ module pcileech_bar_impl_mz0380_mb (
 
     // LOAD_FILES (0x6e) 4 KiB scratch (M76)
     bit [7:0]   lf_mem [0:4095];
-    bit         lf_is_write;
     bit [15:0]  lf_offset;
     bit         lf_wr_fire;
 
@@ -236,14 +235,15 @@ module pcileech_bar_impl_mz0380_mb (
                             //   is_write = cmd[5]   = PARAM0[15:8]
                             //   offset   = cmd[6..7] = PARAM0[31:16] (LE u16)
                             //   16 data bytes = cmd[8..23] = PARAM1..PARAM4
-                            // Read: result 16 bytes go home in PARAM1..PARAM4
-                            // (vcm pwrites the whole 44-byte command back).
-                            lf_is_write <= |regs[1][15:8];
+                            //                 = regs[2..5]
+                            // Read: result 16 bytes go home in PARAM1..PARAM4;
+                            // PARAM0 (regs[1]) keeps the control word so the
+                            // host reads the 44-byte command back intact.
                             lf_offset   <= regs[1][31:16];
                             lf_wr_fire  <= |regs[1][15:8];
                             if ( !regs[1][15:8] ) begin
                                 // read: 16 scratch bytes -> PARAM1..PARAM4
-                                { regs[4], regs[3], regs[2], regs[1] } <= lf_read16(regs[1][31:16]);
+                                { regs[5], regs[4], regs[3], regs[2] } <= lf_read16(regs[1][31:16]);
                             end
                         end
                         default: begin
@@ -276,13 +276,13 @@ module pcileech_bar_impl_mz0380_mb (
             if ( p_rd_d )
                 regs[4][7:0] <= p_nak ? 8'h0 : p_rdata;
 
-            // LOAD_FILES write fire: 16 bytes from the PARAM payload into
-            // scratch. lf_wr_fire is the 1-cycle pulse set by the doorbell
+            // LOAD_FILES write fire: 16 bytes of PARAM1..PARAM4 (regs[2..5])
+            // into scratch. lf_wr_fire is the 1-cycle pulse set by the doorbell
             // dispatch; the PARAM/offset values it reads were latched then.
             if ( lf_wr_fire ) begin
                 for ( int k = 0; k < 16; k++ ) begin
                     lf_mem[(lf_offset + 16'(k)) & 12'hfff] <=
-                        regs[1 + k[3:2]][8*(k % 4) +: 8];
+                        regs[2 + k[3:2]][8*(k % 4) +: 8];
                 end
             end
         end

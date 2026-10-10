@@ -60,8 +60,8 @@ module pcileech_dma_engine (
     localparam int unsigned TLP_FULL   = 6226;                  // full 512B-payload TLPs
     localparam bit [9:0]    DWLEN_FULL = 10'd128;               // 512B data
     localparam bit [9:0]    DWLEN_TAIL = 10'd112;               // 448B data
-    localparam bit [5:0]    BEATS_FULL = 6'd33;                 // 1 hdr + 31 + partial
-    localparam bit [5:0]    BEATS_TAIL = 6'd29;                 // 1 hdr + 27 + partial
+    localparam bit [5:0]    BEATS_FULL = 6'd33;                 // 1 hdr + 32 data
+    localparam bit [5:0]    BEATS_TAIL = 6'd29;                 // 1 hdr + 28 data
 
     // ------------------------------------------------------------------
     // splash byte generator (matches tools/gen_logo_mem.py exactly)
@@ -117,7 +117,7 @@ module pcileech_dma_engine (
     bit         beat_presented;                              // a beat sits in the regs
 
     wire        arm_rise  = (state == S_IDLE) && mz_arm && (mz_vid_slots != 3'd0);
-    wire        abort     = (state == S_SEND) && !mz_arm;    // STOP mid-send
+    wire        mid_tlp   = (beat_cnt != 6'd0) || beat_presented;  // a TLP is in flight
     wire        last_tlp  = (tlp_cnt == TLP_FULL);
     wire [9:0]  cur_dwlen = last_tlp ? DWLEN_TAIL : DWLEN_FULL;
     wire [5:0]  cur_beats = last_tlp ? BEATS_TAIL : BEATS_FULL;
@@ -144,7 +144,7 @@ module pcileech_dma_engine (
     // has_data must be high before the first beat is presented, otherwise the
     // mux never grants tready and the source deadlocks: assert it for the whole
     // active burst. One beat is outstanding at a time (tvalid = beat_presented).
-    assign tlps_out.has_data   = (state == S_SEND) && !abort;
+    assign tlps_out.has_data   = (state == S_SEND) && (mz_arm || mid_tlp);
     assign tlps_out.tvalid     = beat_presented;
 
     // ------------------------------------------------------------------
@@ -177,19 +177,19 @@ module pcileech_dma_engine (
             // ---- FSM ----
             case ( state )
                 S_IDLE: begin
-                    tlp_cnt  <= 13'd0;
-                    beat_cnt <= 6'd0;
-                    byte_idx <= 22'd0;
-                    addr_lo  <= mz_vid_base[31:0];               // slot0 lo
+                    tlp_cnt        <= 13'd0;
+                    beat_cnt       <= 6'd0;
+                    byte_idx       <= 22'd0;
+                    beat_presented <= 1'b0;                      // never carry a beat into idle
+                    tlast_q        <= 1'b0;
+                    addr_lo        <= mz_vid_base[31:0];         // slot0 lo
                     if ( arm_rise )
                         state <= S_SEND;
                 end
 
                 S_SEND: begin
-                    if ( abort ) begin
-                        state <= S_IDLE;                         // no completion pulse
-                    end
-                    else if ( beat_accept && tlast_q ) begin
+                    if ( beat_accept && tlast_q ) begin
+                        // current TLP has fully drained onto the wire
                         if ( last_tlp ) begin
                             state          <= S_DONE;
                             mz_frame_done  <= 1'b1;
@@ -197,12 +197,21 @@ module pcileech_dma_engine (
                             mz_frame_token <= { frame_cnt[28:0], 3'b000 };  // buf idx 0 (M17)
                             mz_int_req     <= 1'b1;
                         end
+                        else if ( !mz_arm ) begin
+                            // STOP: honour it here, at the TLP boundary, so the
+                            // in-flight TLP is never truncated (no completion).
+                            state <= S_IDLE;
+                        end
                         else begin
                             tlp_cnt  <= tlp_cnt + 13'd1;
                             beat_cnt <= 6'd0;
                             // address advance: 512B per TLP, low-half wrap (M25/M26)
                             addr_lo  <= addr_lo + 32'h200;
                         end
+                    end
+                    else if ( !mz_arm && !mid_tlp ) begin
+                        // STOP before any beat of the next TLP started: idle now
+                        state <= S_IDLE;
                     end
                 end
 
@@ -223,7 +232,9 @@ module pcileech_dma_engine (
             // data beat of the TLP asserts tlast.
             //   beat 0                : header (DW0..DW3)
             //   beats 1..cur_beats-1  : 16 data bytes, last one sets tlast
-            if ( (state == S_SEND) && !abort && (!beat_presented || beat_accept) ) begin
+            // On STOP (mz_arm low) a TLP already in flight (mid_tlp) is still
+            // driven to completion; only the next TLP is withheld.
+            if ( (state == S_SEND) && (mz_arm || mid_tlp) && (!beat_presented || beat_accept) ) begin
                 if ( beat_cnt == 6'd0 ) begin
                     // header beat
                     tdata_q        <= { dw3, dw2, dw1, dw0 };
